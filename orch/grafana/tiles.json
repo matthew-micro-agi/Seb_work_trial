@@ -1,0 +1,31 @@
+{
+  "title": "Tiles",
+  "uid": "tiles",
+  "schemaVersion": 39,
+  "editable": true,
+  "refresh": "1s",
+  "time": {"from": "now-15m", "to": "now"},
+  "templating": {"list": []},
+  "panels": [
+    {"id": 1, "type": "timeseries", "title": "fps_in", "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8},
+     "datasource": {"type": "prometheus"},
+     "targets": [{"expr": "tile_fps_in", "legendFormat": "{{node}}"}]},
+    {"id": 2, "type": "timeseries", "title": "K", "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8},
+     "datasource": {"type": "prometheus"},
+     "targets": [{"expr": "tile_k", "legendFormat": "{{node}} epoch {{epoch}}"}]},
+    {"id": 3, "type": "timeseries", "title": "used and locked bytes", "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8},
+     "datasource": {"type": "prometheus"},
+     "fieldConfig": {"defaults": {"unit": "bytes"}, "overrides": []},
+     "targets": [{"expr": "tile_used_bytes", "legendFormat": "{{node}} used"}, {"expr": "tile_locked_bytes", "legendFormat": "{{node}} locked"}]},
+    {"id": 4, "type": "timeseries", "title": "faults per second", "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8},
+     "datasource": {"type": "prometheus"},
+     "targets": [{"expr": "tile_faults_1s", "legendFormat": "{{node}}"}]},
+    {"id": 5, "type": "timeseries", "title": "temperature", "gridPos": {"x": 0, "y": 16, "w": 12, "h": 6},
+     "datasource": {"type": "prometheus"},
+     "fieldConfig": {"defaults": {"unit": "celsius"}, "overrides": []},
+     "targets": [{"expr": "tile_temp_c", "legendFormat": "{{node}}"}]},
+    {"id": 6, "type": "timeseries", "title": "load1", "gridPos": {"x": 12, "y": 16, "w": 12, "h": 6},
+     "datasource": {"type": "prometheus"},
+     "targets": [{"expr": "tile_load1", "legendFormat": "{{node}}"}]}
+  ]
+}

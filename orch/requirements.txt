@@ -1,0 +1,11 @@
+# The data half's one third-party dependency (orch/data/foxglove.py: `orch bridge`, `orch mcap`). Everything
+# else in orch is the standard library plus icd/ and sei/ from this repo. Install into a venv on the laptop:
+#
+#   python3 -m venv ~/.venv/orch && ~/.venv/orch/bin/pip install -r orch/requirements.txt
+#   ~/.venv/orch/bin/python -m orch bridge ...
+#
+# `orch control` and `orch fetch` run with the system python3 (3.12) and no venv.
+foxglove-sdk==0.27.0
+# only for the tests and for looking at the output: the bridge probe and `mcap` reader
+websockets>=13
+mcap>=1.3

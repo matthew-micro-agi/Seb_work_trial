@@ -1,0 +1,4 @@
+# Tiles this orchestrator talks to. One "host:port" per line under nodes:.
+# Used when --nodes is not given. The bench EVM (HOWTO.md §1):
+nodes:
+  - 192.168.168.2:8080

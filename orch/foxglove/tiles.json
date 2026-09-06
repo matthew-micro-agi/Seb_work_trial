@@ -1,0 +1,37 @@
+{
+  "configById": {
+    "Image!tile": {
+      "cameraState": {},
+      "imageMode": {"imageTopic": "/tile/c0d60af14f9e/video"},
+      "topics": {},
+      "layers": {}
+    },
+    "Plot!fps": {
+      "title": "fps_in / used bytes",
+      "paths": [
+        {"value": "/tile/c0d60af14f9e/telemetry.fps_in", "enabled": true, "timestampMethod": "receiveTime"},
+        {"value": "/tile/c0d60af14f9e/telemetry.used_bytes", "enabled": true, "timestampMethod": "receiveTime"}
+      ],
+      "showXAxisLabels": true, "showYAxisLabels": true, "showLegend": true, "legendDisplay": "floating",
+      "showPlotValuesInLegend": false, "isSynced": true, "xAxisVal": "timestamp", "sidebarDimension": 240
+    },
+    "StateTransitions!state": {
+      "paths": [
+        {"value": "/tile/c0d60af14f9e/health.recording.state", "timestampMethod": "receiveTime"},
+        {"value": "/tile/c0d60af14f9e/link.reachable", "timestampMethod": "receiveTime"}
+      ],
+      "isSynced": true
+    },
+    "RawMessages!frame": {"topicPath": "/tile/c0d60af14f9e/frame", "diffEnabled": false, "diffMethod": "custom", "diffTopicPath": "", "showFullMessageForDiff": false},
+    "RawMessages!health": {"topicPath": "/tile/c0d60af14f9e/health", "diffEnabled": false, "diffMethod": "custom", "diffTopicPath": "", "showFullMessageForDiff": false, "expansion": "all"}
+  },
+  "globalVariables": {},
+  "userNodes": {},
+  "playbackConfig": {"speed": 1},
+  "layout": {
+    "direction": "row",
+    "first": {"direction": "column", "first": "Image!tile", "second": "RawMessages!frame", "splitPercentage": 75},
+    "second": {"direction": "column", "first": "Plot!fps", "second": {"direction": "column", "first": "StateTransitions!state", "second": "RawMessages!health", "splitPercentage": 40}, "splitPercentage": 40},
+    "splitPercentage": 60
+  }
+}
