@@ -1,0 +1,422 @@
+// tile.v1 — the contract between the orchestrator and one camera tile.
+//
+// This file is the interface. DESIGN_RING_CONTROL.md §8 explains it; icd/conformance.py tests it.
+// Both tiers implement it; the conformance suite judges a node against the capabilities it declares.
+//
+// Transport: HTTP/1.1. Every rpc is  POST /tile.v1.Tile/<Method>  with the request in the body and the
+// reply in the response, Content-Type application/json: the proto3 JSON mapping, lowerCamelCase field
+// names (parsers accept the original names too), int64/uint64 fields as decimal strings. curl and jq work.
+// application/proto (binary) is reserved for the C++ and MCU clients; a node without it answers 415.
+// A method whose capability the node does not declare answers 501 with an Error body.
+// Errors: HTTP status plus an Error body; Error.code names the HTTP status (§ Error).
+//
+// Bulk bytes are not protobuf messages:
+//   GET /v1/segments/{segno}/data   one segment file, application/octet-stream, Range supported   [segments]
+//   GET /v1/live                    the proxy substream (Config.proxy): chunked Annex-B from the next IDR on,
+//                                   until the client closes; H.264, every AU carries the SEI           [live]
+//   GET /v1/sessions/{id}/log       the recorder's JSONL event log                                  [sessions]
+//   GET /v1/trigger/log             the pulse source's K <-> time log, one JSON line per second:
+//                                   {"epoch":2,"k":1188000,"ptp_ns":"...","utc_ns":"..."|null}      [trigger.log]
+//   GET /metrics                    Prometheus text format, the Telemetry fields                    [metrics]
+// Capabilities in brackets. Every access unit in the video byte streams carries the camsync SEI
+// (epoch, K, frame time, faults).
+//
+// Evolution: field numbers are never reused; readers ignore unknown fields; a removed field keeps its
+// number reserved. api_version bumps on every change together with the conformance suite.
+
+syntax = "proto3";
+
+package tile.v1;
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────
+// Service
+
+service Tile {
+  // Identity, health, time ────────────────────────────────────────────────── capability: core
+  rpc GetNode(Empty) returns (Node);
+  rpc GetHealth(Empty) returns (Health);          // states and active faults; poll at 1 Hz or slower
+  rpc GetTelemetry(Empty) returns (Telemetry);    // one sample of the counters; poll at 1 Hz for plots
+  rpc GetTime(Empty) returns (Time);              // relate the caller's wall clock to this node's PTP clock
+
+  // Configuration ─────────────────────────────────────────────────────────── capability: core
+  rpc GetConfig(Empty) returns (Config);          // the effective configuration (node config, overridden by the session)
+  //                                                                            capability: config.live_sensor
+  rpc SetSensor(SensorSettings) returns (Config); // change exposure/gain while recording; 409 if not live-capable
+
+  // Trigger ───────────────────────────────────────────────────────────────── capability: trigger.local | trigger.external
+  rpc GetTrigger(Empty) returns (TriggerStatus);
+  rpc SetTrigger(TriggerSettings) returns (TriggerStatus);   // arm/disarm, rate, exposure pulse, source
+
+  // Recording ─────────────────────────────────────────────────────────────── capability: recording
+  rpc GetRecording(Empty) returns (RecordingStatus);
+  rpc StartRecording(StartRecordingRequest) returns (RecordingStatus);   // 409 if running or stopping
+  rpc StopRecording(Empty) returns (RecordingStatus);                    // closes the open segment first; idempotent
+
+  // Footage ───────────────────────────────────────────────────────────────── capability: segments
+  rpc ListSegments(ListSegmentsRequest) returns (SegmentList);   // then GET /v1/segments/{segno}/data per entry
+  rpc GetSegment(SegnoRequest) returns (Segment);
+  //                                                                            capability: sessions
+  rpc ListSessions(Empty) returns (SessionList);
+
+  // Locks ─────────────────────────────────────────────────────────────────── capability: locks
+  rpc ListLocks(Empty) returns (LockList);
+  rpc GetLock(LockId) returns (Lock);
+  rpc PutLock(PutLockRequest) returns (PutLockResponse);   // idempotent: a repeat with a new selector adds
+  rpc DeleteLock(LockId) returns (Empty);
+}
+
+message Empty {}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────
+// Errors
+
+message Error {
+  enum Code {
+    CODE_UNSPECIFIED = 0;
+    BAD_REQUEST = 1;            // HTTP 400: malformed body, selector missing or more than one set
+    NOT_FOUND = 2;              // HTTP 404: unknown segno, lock, session
+    CONFLICT = 3;               // HTTP 409: start while running, live change on a non-live field
+    NOT_IMPLEMENTED = 4;        // HTTP 501: method outside the declared capabilities
+    NOT_READY = 5;              // HTTP 503: index rebuilding, storage error
+    INSUFFICIENT_STORAGE = 6;   // HTTP 507: lock would exceed lock_budget_bytes
+    INTERNAL = 7;               // HTTP 500
+    UNSUPPORTED_MEDIA_TYPE = 8; // HTTP 415: a Content-Type the node does not serve
+  }
+  Code code = 1;
+  string message = 2;          // for humans
+  map<string, string> detail = 3;   // for machines, e.g. {"segno": "123"}, {"needed_bytes": "…"}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────
+// Identity, time
+
+message Node {
+  string node_id = 1;          // stable per board; the eth0 MAC until device identity exists
+  string hw = 2;               // "j722s-evm", "b1", "b1-lite", "pc"
+  string firmware = 3;         // git describe
+  string api_version = 4;      // "1.1"
+  repeated string capabilities = 5;   // core, recording, trigger.local, trigger.external, trigger.log,
+                                      // segments, sessions, locks, live, metrics, config.live_sensor
+}
+
+// Monotonic time never crosses the wire (it restarts every boot); PTP time does, with the offset the node
+// measured itself. boot_id names the domain in which an unlocked PTP clock is meaningful.
+message Time {
+  int64 ptp_ns = 1;            // the node's PTP hardware clock now (CPTS). Absolute only if ptp_locked
+  bool ptp_locked = 2;         // disciplined by a grandmaster; false on the bench and after sync loss
+  reserved 3;                  // mono_ns
+  string boot_id = 4;
+  int64 ptp_minus_mono_ns = 5; // measured with PTP_SYS_OFFSET_PRECISE; 0 on a node without a PTP clock (PC)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────
+// Configuration
+
+message SensorSettings {
+  uint32 exposure_lines = 1;   // IMX296: 1104 lines ≈ 16 ms; exposure must stay under period − readout
+  uint32 analogue_gain = 2;    // sensor units; IMX296 0..480 = 0..48 dB
+  reserved 3, 4;               // wb_gain_r, wb_gain_b: come with the ISP
+}
+
+message EncoderSettings {
+  uint32 bitrate_bps = 1;      // H.265 target bitrate
+  // GOP is fixed at one second (gop_frames == fps) so segment boundaries fall on IDRs; not settable.
+}
+
+// Node configuration (file or command line), not per session: the ring and its locks outlive sessions.
+message RingSettings {
+  uint32 segment_s = 1;        // segment duration, integer seconds (integer GOPs); a session may override it
+  uint64 budget_bytes = 2;     // bytes the ring may occupy on /ring, locked footage, logs and index included
+  uint64 lock_budget_bytes = 3;// cap on locked bytes; <= budget_bytes − 4 × expected segment bytes
+}
+
+// The live-view substream served on GET /v1/live. Encoded from the same frames as the recording, decimated,
+// never written to disk. H.264 so that browser-based viewers (Foxglove, WebCodecs) decode it everywhere;
+// the recording itself stays H.265.
+message ProxySettings {
+  bool enabled = 1;            // the proxy branch exists on this node and is configured
+  uint32 width = 2;            // 728
+  uint32 height = 3;           // 544
+  uint32 fps = 4;              // 15: every other frame; the SEI still names each frame's K
+  uint32 bitrate_bps = 5;      // 1 000 000
+  reserved 6;                  // codec: H.264 by §8.3a
+}
+
+message Config {
+  uint32 width = 1;
+  uint32 height = 2;
+  uint32 fps = 3;
+  SensorSettings sensor = 4;
+  EncoderSettings encoder = 5;
+  RingSettings ring = 6;
+  ProxySettings proxy = 7;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────
+// Trigger
+
+message TriggerSettings {
+  enum Mode {
+    MODE_UNSPECIFIED = 0;
+    LOCAL = 1;                 // this node generates the pulse (ePWM) and counts what it receives
+    EXTERNAL = 2;              // another board generates it; this node only counts
+  }
+  Mode mode = 1;
+  bool armed = 2;              // LOCAL: pulses on/off. EXTERNAL: counting on/off
+  int64 period_ns = 3;         // 33 333 333 for 30 fps
+  int64 low_ns = 4;            // LOCAL: pulse low time = exposure (IMX296: exposure = low + 14.26 µs)
+}
+
+// Edge capture lives in the recorder: epoch, k, edges_seen and last_edge_ptp_ns are the recorder's latest
+// values and stand still while recording is stopped. A stall is Health.faults_active TRIGGER_STALLED.
+message TriggerStatus {
+  TriggerSettings settings = 1;
+  uint32 epoch = 2;            // current epoch (restarts K)
+  int64 k = 3;                 // index of the last captured edge
+  uint64 edges_seen = 4;       // captured edges since arm
+  int64 last_edge_ptp_ns = 5;
+  reserved 6;                  // stalled
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────
+// Recording
+
+message StartRecordingRequest {
+  enum Edges {
+    EDGES_UNSPECIFIED = 0;
+    PTP = 1;                   // K from captured CPTS edges (the product path)
+    GRID = 2;                  // K from a grid anchored on the first frame (bench without the loop wire)
+  }
+  Edges edges = 1;
+  int64 latency_ns = 2;        // trigger edge to frame timestamp, measured per configuration (M2)
+  reserved 3;                  // config: replaced by the explicit overrides below
+  // Per-session overrides; an absent field keeps the node's configured value (proto3 presence).
+  optional uint32 fps = 4;
+  optional uint32 exposure_lines = 5;
+  optional uint32 analogue_gain = 6;
+  optional uint32 bitrate_bps = 7;
+  optional uint32 segment_s = 8;
+}
+
+// States only; the per-second counters are Telemetry.
+message RecordingStatus {
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    IDLE = 1;
+    RUNNING = 2;
+    reserved 3;                // STALLED: a fault, not a state (TRIGGER_STALLED)
+    ERROR = 4;                 // storage error; StartRecording answers 503 until cleared
+    STOPPING = 5;              // StopRecording sent, the recorder is draining; Start answers 409
+  }
+  State state = 1;
+  string session = 2;          // session id, also the log file name
+  int64 since_ptp_ns = 3;
+  reserved 4 to 9;             // fps_in, fps_out, epoch, k, faults_1s, faults_total: Telemetry
+  uint64 open_segno = 10;      // the segment being written; not yet listable
+  uint32 pre_idr_dropped = 11; // AUs dropped before the first IDR after start
+  uint32 live_clients = 12;    // GET /v1/live clients being served from the proxy branch (§8.3a)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────
+// Footage
+
+// Exactly one of the four ways to name footage. Identical on ListSegments and PutLock.
+message Selector {
+  oneof by {
+    double last_s = 1;         // footage up to the newest closed segment, back this many seconds
+    PtpInterval ptp = 2;       // segments overlapping the interval in PTP time
+    KRange k = 3;              // segments containing any frame with this epoch and K in range
+    SegnoRange segno = 4;      // by handle
+  }
+}
+
+message PtpInterval {
+  int64 since_ns = 1;
+  int64 until_ns = 2;
+}
+
+message KRange {
+  uint32 epoch = 1;
+  int64 k_from = 2;
+  int64 k_to = 3;              // inclusive
+}
+
+message SegnoRange {
+  uint64 from = 1;
+  uint64 to = 2;               // inclusive
+}
+
+// The reply holds every matching segment; a full ring is about 10 000 rows.
+message ListSegmentsRequest {
+  Selector select = 1;
+  reserved 2;                  // limit
+}
+
+message SegnoRequest {
+  uint64 segno = 1;
+}
+
+// Per-frame fault bits. Value = bit index + 1 of kmatch::Fault (kmatch/include/kmatch/types.hpp) and of the
+// SEI flags field; sei/tests/test_faults.py checks the correspondence.
+enum Fault {
+  FAULT_NONE = 0;
+  DUPLICATE = 1;
+  DELIVERY_LOST = 2;
+  SENSOR_MISSED = 3;
+  LATE = 4;
+  UNMATCHED = 5;
+  EPOCH_CHANGE = 6;
+  SEQ_REGRESSION = 7;
+  EDGE_PENDING = 8;
+  K_CORRECTED = 9;
+  K_LOCAL = 10;                // not an error: this frame's K was never anchored to a trigger source, so
+                               // it counts pulses from wherever the recorder started. Unique inside the
+                               // session, not comparable with another tile or another recording.
+}
+
+message KPoint {
+  uint32 epoch = 1;
+  int64 k = 2;
+}
+
+// Data is GET /v1/segments/{segno}/data.
+message Segment {
+  uint64 segno = 1;            // file name is %012d.h265
+  string session = 2;
+  KPoint first = 3;            // first matched frame; absent if none matched
+  KPoint last = 4;
+  int64 t_ptp_first_ns = 5;    // frame time of the first AU, converted to PTP with the node's measured offset
+  int64 t_ptp_last_ns = 6;
+  uint32 frames = 7;
+  uint64 bytes = 8;
+  repeated Fault faults = 9;   // union over the segment
+  bool partial = 10;           // recovered from a .part after a crash; whole AUs, shorter than segment_s
+  bool reclaimable = 11;       // still in seg/; false once it lives only in locks
+  repeated string locks = 12;
+  reserved 13;                 // data_url
+}
+
+message SegmentList {
+  repeated Segment segments = 1;   // ascending segno
+  reserved 2 to 5;             // truncated, oldest_segno, newest_segno, open_segno: RingStatus / RecordingStatus
+}
+
+// One StartRecording … StopRecording span; a recorder restart inside it keeps the id and is logged.
+// The log is GET /v1/sessions/{id}/log.
+message Session {
+  string id = 1;               // "<boot_id[:8]>-<mono_start_ms>"
+  reserved 2;                  // boot_id: the id's prefix
+  int64 t_ptp_start_ns = 3;
+  reserved 4 to 6;             // config, edges, latency_ns: `start`
+  uint64 segno_first = 7;      // 0 if no segment closed yet
+  uint64 segno_last = 8;
+  reserved 9;                  // log_url
+  StartRecordingRequest start = 10;
+}
+
+message SessionList {
+  repeated Session sessions = 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────
+// Locks
+
+message LockId {
+  string id = 1;
+}
+
+message Lock {
+  string id = 1;               // client-chosen
+  string reason = 2;
+  string requester = 3;
+  int64 created_ptp_ns = 4;
+  repeated uint64 segnos = 5;
+  uint64 bytes = 6;
+}
+
+message PutLockRequest {
+  string id = 1;
+  Selector select = 2;
+  string reason = 3;
+  string requester = 4;
+}
+
+message PutLockResponse {
+  Lock lock = 1;
+  bool created = 2;            // false: the lock existed and `added` was unioned in
+  repeated uint64 added = 3;
+  repeated uint64 missing = 4; // selected but reclaimed between list and lock
+}
+
+message LockList {
+  repeated Lock locks = 1;
+  reserved 2, 3;               // locked_bytes, lock_budget_bytes: RingStatus, Config
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────
+// Health and telemetry
+
+enum NodeFault {
+  NODE_FAULT_NONE = 0;
+  TRIGGER_STALLED = 1;         // no edge for two periods
+  STORAGE_FULL = 2;            // reclaim found no unlocked victim (cannot happen while the cap holds)
+  INDEX_REBUILDING = 3;        // list and lock answer 503; fetch by segno works
+  STORAGE_ERROR = 4;           // eMMC I/O error; recorder stopped
+  STORAGE_WEAR_WARNING = 5;    // eMMC pre_eol >= 2
+  RECORDER_DOWN = 6;           // recorder process died; being restarted
+  PTP_UNLOCKED = 7;            // no grandmaster; PTP time is per-boot, use K
+}
+
+// The tree as it stands. oldest/newest_segno are the lowest and highest closed segment in seg/
+// (reclaimable footage); locked-only segments do not pin them.
+message RingStatus {
+  reserved 1;                  // budget_bytes: Config.ring
+  uint64 used_bytes = 2;       // statvfs, hard links counted once
+  uint64 locked_bytes = 3;
+  reserved 4;                  // lock_budget_bytes: Config.ring
+  uint32 segments = 5;         // closed segments in seg/
+  uint64 oldest_segno = 6;
+  uint64 newest_segno = 7;
+  reserved 8;                  // footage_s = (newest_ptp_ns − oldest_ptp_ns) / 1e9
+  int64 oldest_ptp_ns = 9;
+  int64 newest_ptp_ns = 10;
+}
+
+message StorageStatus {
+  string device = 1;           // "mmcblk0p2"
+  uint64 fs_free_bytes = 2;
+  uint32 life_time_a = 3;      // eMMC EXT_CSD DEVICE_LIFE_TIME_EST_TYP_A, 0x01 = 0–10 % used
+  uint32 life_time_b = 4;
+  uint32 pre_eol = 5;          // 1 normal, 2 warning, 3 urgent
+}
+
+// States and faults. Everything here changes rarely; poll at 1 Hz or slower.
+message Health {
+  RecordingStatus recording = 1;
+  TriggerStatus trigger = 2;
+  RingStatus ring = 3;
+  StorageStatus storage = 4;
+  reserved 5;                  // SystemStatus: uptime_s below, load1 and temp_c in Telemetry
+  Time clocks = 6;
+  repeated NodeFault faults_active = 7;
+  uint32 uptime_s = 8;
+}
+
+// One sample of the counters, for plotting; /metrics is this message in Prometheus text.
+// Poll at 1 Hz; the node keeps no history.
+message Telemetry {
+  int64 t_ptp_ns = 1;          // when the sample was taken
+  uint32 fps_in = 2;
+  uint32 fps_out = 3;
+  uint64 bytes_written_1s = 4;
+  uint32 edges_seen_1s = 5;
+  uint32 faults_1s = 6;
+  int64 k = 7;
+  uint32 epoch = 8;
+  uint64 used_bytes = 9;
+  uint64 locked_bytes = 10;
+  reserved 11;                 // cpu_percent
+  float temp_c = 12;
+  reserved 13 to 15;           // ptp_minus_mono_ns (Time), residual_p50_ns, residual_p99_ns
+  float load1 = 16;            // /proc/loadavg
+}
