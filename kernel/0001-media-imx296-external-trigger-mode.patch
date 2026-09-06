@@ -1,0 +1,50 @@
+media: i2c: imx296: add external trigger mode
+
+With the DT boolean property trigger-mode the sensor is put in external
+trigger mode at stream on (CTRL0B TRIGEN, LOWLAGTRG fast): it exposes once
+per XTRIG pulse and the pulse width sets the exposure time. Register usage
+follows the Raspberry Pi imx296 driver. Against the v6.12 driver.
+
+--- a/drivers/media/i2c/imx296.c
++++ b/drivers/media/i2c/imx296.c
+@@ -10,6 +10,7 @@
+ #include <linux/i2c.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
++#include <linux/property.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/regmap.h>
+ #include <linux/regulator/consumer.h>
+@@ -200,6 +201,7 @@
+ 
+ 	const struct imx296_clk_params *clk_params;
+ 	bool mono;
++	bool trigger;
+ 
+ 	struct v4l2_subdev subdev;
+ 	struct media_pad pad;
+@@ -578,6 +580,15 @@
+ 
+ 	imx296_write(sensor, IMX296_CTRL00, 0, &ret);
+ 	usleep_range(2000, 5000);
++	/*
++	 * External trigger mode: the sensor exposes once per XTRIG pulse and the
++	 * pulse width sets the exposure time. LOWLAGTRG shortens the trigger to
++	 * exposure latency.
++	 */
++	imx296_write(sensor, IMX296_CTRL0B,
++		     sensor->trigger ? IMX296_CTRL0B_TRIGEN : 0, &ret);
++	imx296_write(sensor, IMX296_LOWLAGTRG,
++		     sensor->trigger ? IMX296_LOWLAGTRG_FAST : 0, &ret);
+ 	imx296_write(sensor, IMX296_CTRL0A, 0, &ret);
+ 
+ 	return ret;
+@@ -1077,6 +1088,8 @@
+ 	if (ret < 0)
+ 		goto err_power;
+ 
++	sensor->trigger = device_property_read_bool(sensor->dev, "trigger-mode");
++
+ 	/* Initialize the V4L2 subdev. */
+ 	ret = imx296_subdev_init(sensor);
+ 	if (ret < 0)
