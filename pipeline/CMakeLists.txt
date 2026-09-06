@@ -1,0 +1,20 @@
+cmake_minimum_required(VERSION 3.16)
+project(kpipe CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(GST REQUIRED gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0)
+find_package(Threads REQUIRED)
+
+set(KMATCH ${CMAKE_CURRENT_SOURCE_DIR}/../kmatch)
+add_library(kmatch STATIC ${KMATCH}/src/types.cpp ${KMATCH}/src/edges.cpp ${KMATCH}/src/matcher.cpp)
+target_include_directories(kmatch PUBLIC ${KMATCH}/include)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../segfile segfile)   # brings sei; also builds kpipe-synth and ringfsck
+
+add_executable(kpipe src/kpipe.cpp src/kmeta.cpp src/livesock.cpp src/v4l2cap.cpp src/edgefeed.cpp)
+target_include_directories(kpipe PRIVATE ${GST_INCLUDE_DIRS} src)
+target_link_libraries(kpipe kmatch segfile ${GST_LIBRARIES} Threads::Threads)
+target_compile_options(kpipe PRIVATE -Wall -Wextra ${GST_CFLAGS_OTHER})
