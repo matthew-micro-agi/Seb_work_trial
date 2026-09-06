@@ -1,0 +1,12 @@
+[Unit]
+Description=Segment ring on the eMMC (mmcblk0p2, ext4 label "ring")
+Documentation=file:/opt/ti_workspace/DESIGN_RING_CONTROL.md
+
+[Mount]
+What=/dev/disk/by-label/ring
+Where=/ring
+Type=ext4
+Options=noatime,data=ordered,commit=5,errors=remount-ro
+
+[Install]
+WantedBy=multi-user.target

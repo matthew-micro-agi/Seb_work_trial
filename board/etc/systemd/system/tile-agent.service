@@ -1,0 +1,21 @@
+[Unit]
+Description=tile-agent: tile.v1 on :8080 over the ring at /ring
+Documentation=file:/opt/ti_workspace/DESIGN_RING_CONTROL.md
+Requires=ring.mount
+After=ring.mount network.target imx296-reprobe.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ti_workspace
+# 26 GiB of the 29.6 GB partition; the recorder is pipeline/kpipe.sh (built on the board, HOWTO.md §6b).
+# --beacon-src is this node's own trigger log: it generates the pulses and counts them, so it is its own
+# source (PLAN_K_MATCHING.md §4). Without it a recorder restart numbers K from zero again (OPEN.md §1c).
+# With an external source, point it at that board instead.
+ExecStart=/usr/bin/python3 -m tileagent --ring /ring --port 8080 --budget 26G --beacon-src http://127.0.0.1:8080/v1/trigger/log
+Restart=on-failure
+RestartSec=3
+KillMode=mixed
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
