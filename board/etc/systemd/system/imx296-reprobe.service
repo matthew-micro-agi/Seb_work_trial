@@ -1,0 +1,9 @@
+[Unit]
+Description=Re-probe the IMX296 until it reports its model (slow module power-up)
+After=multi-user.target
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 2
+ExecStart=/usr/local/bin/imx296-reprobe.sh
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Enable the camera I2C controller (main_i2c2, the TCA9543 muxes behind the CSI connectors).
+ * The SDK 10 base device tree of the J722S EVM leaves it disabled and TI's camera overlays
+ * do not enable it, so no sensor can probe without this.
+ */
+/dts-v1/;
+/plugin/;
+
+&main_i2c2 {
+	status = "okay";
+};

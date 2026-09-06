@@ -1,0 +1,125 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Sony IMX296 (global shutter, 1456x1088, 1 MIPI lane) on the J722S EVM camera connector J33
+ * (CSI port 0). Modelled on TI's k3-j722s-evm-csi2-quad-rpi-cam-imx219.dtso.
+ *
+ * Raw pinctrl value: 0x00010007 = PIN_OUTPUT | mux 7 (GPIO). Pad 0x003c is GPMC0_AD0 = GPIO0_15,
+ * which the EVM routes to J33 pin 17 (CAM_PWDN). On the Arducam module that pin enables the
+ * module's power (regulators and the 54 MHz oscillator), so it is modelled as a fixed regulator
+ * with a 500 ms start-up delay, as Raspberry Pi does, not as the sensor's reset line: with
+ * reset-gpios the driver waited about 1 ms after raising the pin and the probe failed whenever the
+ * module had been off ("invalid device model 0x0000", "failed to get sensor out of standby").
+ *
+ * The Arducam/Raspberry Pi IMX296 boards carry a 54 MHz oscillator; the driver accepts 37.125, 54 (with the
+ * camsync patch) or 74.25 MHz. trigger-mode = <1> puts the sensor in external trigger mode
+ * (kernel/0001-media-imx296-external-trigger-mode.patch); exposure is then the XTRIG pulse width.
+ */
+/dts-v1/;
+/plugin/;
+
+&main_pmx0 {
+	cam0_reset_pins_default: cam0-reset-default-pins {
+		pinctrl-single,pins = <
+			0x003c 0x00010007 /* GPMC0_AD0.GPIO0_15  J33.17 CAM_PWDN -> XCLR */
+		>;
+	};
+};
+
+&{/} {
+	clk_imx296_fixed: imx296-inck {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <54000000>;
+	};
+
+	cam0_avdd: regulator-cam0-avdd {
+		compatible = "regulator-fixed";
+		regulator-name = "cam0_avdd";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam0_reset_pins_default>;
+		gpio = <&main_gpio0 15 0>; /* GPIO_ACTIVE_HIGH: J33.17 high = module powered */
+		enable-active-high;
+		startup-delay-us = <500000>;
+		regulator-always-on; /* the module takes long to come alive: keep it powered from boot, never cycle it */
+	};
+
+	cam_dummy_reg: regulator-cam-dummy {
+		compatible = "regulator-fixed";
+		regulator-name = "cam_dummy";
+		regulator-always-on;
+	};
+};
+
+&exp1 {
+	p06-hog {
+		/* P06 - CSI01_MUX_SEL_2: route CSI0/CSI1 to the 22-pin flex connectors */
+		gpio-hog;
+		gpios = <6 0>;
+		output-high;
+		line-name = "CSI01_MUX_SEL_2";
+	};
+};
+
+&pca9543_0 {
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	i2c-alias-pool = /bits/ 16 <0x1a 0x1b>;
+
+	/* CAM0 I2C, mux port 0 = J33 */
+	i2c@0 {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		reg = <0>;
+
+		imx296_0: sensor@1a {
+			compatible = "sony,imx296";
+			reg = <0x1a>;
+
+			clocks = <&clk_imx296_fixed>;
+			clock-names = "inck";
+
+			avdd-supply = <&cam0_avdd>;
+			dvdd-supply = <&cam_dummy_reg>;
+			ovdd-supply = <&cam_dummy_reg>;
+
+			port {
+				csi2_cam0: endpoint {
+					remote-endpoint = <&csi2rx0_in_sensor>;
+					link-frequencies = /bits/ 64 <594000000>;
+					clock-lanes = <0>;
+					data-lanes = <1>;
+				};
+			};
+		};
+	};
+};
+
+&cdns_csi2rx0 {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		csi0_port0: port@0 {
+			reg = <0>;
+			status = "okay";
+
+			csi2rx0_in_sensor: endpoint {
+				remote-endpoint = <&csi2_cam0>;
+				bus-type = <4>; /* CSI2 DPHY */
+				clock-lanes = <0>;
+				data-lanes = <1>;
+			};
+		};
+	};
+};
+
+&ti_csi2rx0 {
+	status = "okay";
+};
+
+&dphy0 {
+	status = "okay";
+};

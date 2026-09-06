@@ -1,0 +1,92 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * J28 (40-pin user expansion header, 3.3 V) pins for the trigger and its timestamps.
+ * Pad offsets and mux modes from the AM67A datasheet pin attributes table, header pin
+ * numbers from the EVM schematic sheet "USER EXPANSION CONNECTOR" (docs/imx296_trial_plan.md §4).
+ *
+ * Raw k3-pinctrl encodings: 0x00010000 PIN_OUTPUT (pull off), 0x00040000 PIN_INPUT_PULLDOWN,
+ * low nibble = mux mode.
+ *
+ *   pad     ball  mode  signal                     J28  role
+ *   0x01b4  B20   2     EHRPWM0_A                  29   TRIG_OUT   trigger pulse, exposure = low time
+ *   0x01c0  E19   1     CP_GEMAC_CPTS0_HW1TSPUSH   33   TRIG_TS    loop from pin 29: CPTS stamps every edge (PTP extts channel 0)
+ *   0x01b8  C20   3     ECAP0_IN_APWM_OUT          32   XVS_TS     sensor XVS via level shifter: eCAP0 captures exposures (/dev/counter0)
+ *   0x0088  N22   7     GPIO0_33                   13   TRIG_MON   trigger monitor on a GPIO (kernel-timestamped edges)
+ *   0x00ac  P21   7     GPIO0_42                   22   XVS_IN     XVS on a GPIO (count / witness)
+ *   0x00a8  R27   7     GPIO0_41                   36   LED        output for the LED index test
+ *   0x0094  P26   7     GPIO0_36                   37   SPARE_IN
+ *
+ * The HW1TSPUSH pad does not reach CPTS directly: it enters the TIMESYNC_EVENT_INTROUTER (0xA40000)
+ * as input 12, and CPSW0's CPTS HW1_PUSH is the router's output 10 (TRM SPRUJB3D table 4-231 and
+ * the pin-function tables; verified on the bench 2026-09-05, the events appear as extts channel 0).
+ * The stock J722S tree has no node for the router, so this overlay adds it as a pinctrl-single, the
+ * idiom TI uses on the AM62A SK: register 0x4 + 4*out, value 0x10000 | in. The HW2TSPUSH pad (E20)
+ * is not on J28, so XVS uses eCAP0 on C20 instead (counter subsystem, ti-ecap-capture).
+ * C20 also carries EHRPWM0_B (mode 2), which the older overlay used for the trigger.
+ * All pinctrl groups hang off epwm0 because the base tree already owns main_gpio0's pinctrl
+ * and cpsw's; an overlay must not replace those.
+ */
+/dts-v1/;
+/plugin/;
+
+&main_pmx0 {
+	camsync_epwm0_pins_default: camsync-epwm0-default-pins {
+		pinctrl-single,pins = <
+			0x01b4 0x00010002 /* (B20) SPI0_CS0.EHRPWM0_A  J28.29 TRIG_OUT */
+		>;
+	};
+
+	camsync_cpts_pins_default: camsync-cpts-default-pins {
+		pinctrl-single,pins = <
+			0x01c0 0x00040001 /* (E19) SPI0_D1.CPTS0_HW1TSPUSH  J28.33 TRIG_TS in */
+		>;
+	};
+
+	camsync_ecap0_pins_default: camsync-ecap0-default-pins {
+		pinctrl-single,pins = <
+			0x01b8 0x00040003 /* (C20) SPI0_CS1.ECAP0_IN_APWM_OUT J28.32 XVS_TS in */
+		>;
+	};
+
+	camsync_gpio0_pins_default: camsync-gpio0-default-pins {
+		pinctrl-single,pins = <
+			0x0088 0x00040007 /* (N22) GPMC0_OEn_REn.GPIO0_33  J28.13 TRIG_MON in  */
+			0x00ac 0x00040007 /* (P21) GPMC0_CSn1.GPIO0_42     J28.22 XVS_IN   in  */
+			0x00a8 0x00010007 /* (R27) GPMC0_CSn0.GPIO0_41     J28.36 LED      out */
+			0x0094 0x00040007 /* (P26) GPMC0_BE1n.GPIO0_36     J28.37 SPARE_IN in  */
+		>;
+	};
+};
+
+&epwm0 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&camsync_epwm0_pins_default>, <&camsync_cpts_pins_default>, <&camsync_gpio0_pins_default>;
+	status = "okay";
+};
+
+/* eCAP0 as a capture unit (counter subsystem) for the XVS witness on J28.32 */
+&ecap0 {
+	compatible = "ti,am62-ecap-capture";
+	interrupts = <0 145 1>; /* GIC_SPI 145 (ECAP0_ecap_int_0, TRM), IRQ_TYPE_EDGE_RISING */
+	pinctrl-names = "default";
+	pinctrl-0 = <&camsync_ecap0_pins_default>;
+	status = "okay";
+};
+
+&{/bus@f0000} {
+	camsync_timesync_router: pinctrl@a40000 {
+		compatible = "pinctrl-single";
+		reg = <0x00 0xa40000 0x00 0x400>;
+		#pinctrl-cells = <1>;
+		pinctrl-single,register-width = <32>;
+		pinctrl-single,function-mask = <0x000107ff>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&camsync_cpts_routes>;
+
+		camsync_cpts_routes: camsync-cpts-routes {
+			pinctrl-single,pins = <
+				0x2c 0x0001000c /* in 12 (J28.33 HW1TSPUSH pad) -> out 10 (CPSW CPTS HW1_PUSH, extts ch 0) */
+			>;
+		};
+	};
+};

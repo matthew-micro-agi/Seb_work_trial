@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Put the IMX296 on J33 into external trigger mode (needs
+ * kernel/0001-media-imx296-external-trigger-mode.patch): it exposes once per XTRIG
+ * pulse, the low time of the pulse is the exposure. Load after k3-j722s-evm-csi2-imx296.dtbo.
+ */
+/dts-v1/;
+/plugin/;
+
+&imx296_0 {
+	trigger-mode;
+};

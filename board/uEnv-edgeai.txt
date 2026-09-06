@@ -1,0 +1,8 @@
+# uEnv.txt for the Edge AI card (SDK 11, kernel 6.12.17). Differences to the vision-apps card:
+# the remote cores must boot (the ISP runs on them) and the Edge AI overlay stays; it only sets up
+# remoteproc memory, it does not touch the camera I2C or CSI, so ours apply on top of it.
+uenvcmd=if test "$board_name" = "am67-sk"; then ; setenv args_all $args_all systemd.hostname=am67a-sk ; fi
+
+# Setting the right U-Boot environment variables
+dorprocboot=1
+name_overlays=ti/k3-j722s-edgeai-apps.dtbo ti/k3-j722s-evm-camsync-i2c2.dtbo ti/k3-j722s-evm-csi2-imx296.dtbo ti/k3-j722s-evm-camsync-pins.dtbo ti/k3-j722s-evm-imx296-trigger.dtbo
