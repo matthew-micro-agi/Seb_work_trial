@@ -1,0 +1,139 @@
+media: ti: j721e-csi2rx: option to timestamp a buffer at the frame's start
+
+The driver stamps a buffer with ktime_get_ns() in the DMA completion callback.
+The shim opens a PSI-L packet for a frame at its CSI-2 Frame Start and closes
+it with EOP at the Frame End (J722S TRM SPRUJB3D 12.6.1.4.6.1: "once the EOF
+arrives at the FIFO output, all contexts of that type virtual channel ... will
+receive a PSI_EOP"), so the transfer completes at the end of the frame, not at
+its start. V4L2 asks for the time the first data byte was captured.
+
+Usually that is one readout out and nobody notices. It stops being small when
+the source keeps its CSI-2 frame open across the vertical blanking. Measured on
+a J722S EVM with an IMX296 in external trigger mode at 30 Hz, polling the shim's
+per-stream idle bit in CSI_RX_IF_CNTL against the trigger edges captured by the
+CPTS: Frame Start lands 0.150 ms after the trigger pulse and Frame End 33.334 ms
+after it, at the next pulse. One CSI-2 frame is one whole trigger period, the
+1088 lines of readout sitting inside it after the exposure. So every buffer was
+handed over, and stamped, a full period after the pulse that exposed it: 33.39
+ms at 30 Hz and 50.07 ms at 20 Hz, tracking the trigger period and ignoring the
+exposure.
+
+With frame_start_timestamp set, a buffer carries the completion of the transfer
+before it. For such a source that is 0.030 ms after the pulse that exposed this
+frame (200 frames, 0.025 to 0.039 ms), which is where the exposure of a global
+shutter sensor begins.
+
+The driver cannot tell the two kinds of source apart on its own, hence the
+parameter. The obvious test does not work: SHIM_CNTL has a per-stream idle bit,
+but at the DMA completion the stream reads idle either way, because the callback
+runs 30 us after Frame End and the next Frame Start is a further 120 us on. The
+Cadence bridge's frame monitor timer interrupt (STREAMn_MONITOR_CTRL TIMER_EN
+with TIMER_EOF clear, CSIRX_MONITOR_IRQS STREAMn_TIMER_IRQ) would give a real
+Frame Start time and need no parameter, but the monitor only takes effect if it
+is programmed before the stream starts, and its interrupt needs the bridge's
+second interrupt line, which the driver does not request. Left for later.
+
+This corrects the reported time, not the delivery: the transfer still completes
+at the Frame End the source chose. No register moves that. The shim's PSI-L
+framing is fixed - SOP on the first data phase after Frame Start, EOP on Frame
+End - and its whole MMR set is CSIRX_ID, VP0, VP1, CNTL and the per-context
+DMACNTX/PSI_CFG0/PSI_CFG1.
+
+Against ti-linux-6.12.y, on top of the stock driver. Touches the same line of
+ti_csi2rx_dma_callback as 0002, so the two need merging by hand if both are
+wanted.
+
+--- a/drivers/media/platform/ti/j721e-csi2rx/j721e-csi2rx.c
++++ b/drivers/media/platform/ti/j721e-csi2rx/j721e-csi2rx.c
+@@ -64,6 +64,28 @@
+ #define DRAIN_BUFFER_SIZE		SZ_32K
+ #define DRAIN_TIMEOUT_MS		250
+ 
++/*
++ * A source can keep its CSI-2 frame open across the vertical blanking. An IMX296 in external
++ * trigger mode does: measured on a J722S EVM at 30 Hz it sends Frame Start 150 us after the
++ * trigger pulse and Frame End 33.334 ms later, right at the next pulse, so one CSI-2 frame is one
++ * whole trigger period long. The shim opens a PSI-L packet at Frame Start and closes it with EOP
++ * at Frame End, so the transfer for a frame completes one trigger period after the exposure that
++ * filled it, and that is what the buffer used to be stamped with.
++ *
++ * With this set, a buffer carries the completion of the transfer before it instead. For such a
++ * source that is the start of this buffer's own frame, 30 us after the trigger pulse that exposed
++ * it. Leave it clear for a free-running sensor, whose transfer already completes at the end of the
++ * frame it carried.
++ *
++ * The driver cannot tell the two apart on its own. SHIM_CNTL has a per-stream idle bit, but at the
++ * DMA completion the stream reads idle either way: the callback runs 30 us after Frame End and the
++ * next Frame Start is 120 us further on.
++ */
++static bool frame_start_timestamp;
++module_param(frame_start_timestamp, bool, 0644);
++MODULE_PARM_DESC(frame_start_timestamp,
++		 "Timestamp a buffer at its frame's start, for a source whose CSI-2 frame spans the whole frame interval (default 0: at the frame's end, when the transfer completes)");
++
+ struct ti_csi2rx_fmt {
+ 	u32				fourcc;	/* Four character code. */
+ 	u32				code;	/* Mbus code. */
+@@ -111,6 +133,8 @@
+ 	u32				idx;
+ 	u32				vc;
+ 	u32				stream;
++	/* When the previous transfer on this context completed, 0 before the first. */
++	u64				prev_done_ns;
+ };
+ 
+ struct ti_csi2rx_dev {
+@@ -709,6 +733,27 @@
+ 	writel(reg, csi->shim + SHIM_PSI_CFG0(ctx->idx));
+ }
+ 
++/*
++ * The V4L2 timestamp for the buffer whose transfer completed at @now, and remember @now for the
++ * next one. See frame_start_timestamp above: with it set the completion before this one is this
++ * frame's start, which is what V4L2 asks for; without it the completion time is kept, as before.
++ *
++ * The first buffer of a stream has no earlier completion to report and keeps the end of its own
++ * frame, so it and the one after it carry the same time - one frame's end is the next frame's
++ * start. Every buffer after those two is stamped at its own frame's start.
++ *
++ * Called from the drain callback too, so that a frame nobody had a buffer for does not break the
++ * chain. Both callbacks run from the same dmaengine channel, so they are already serialised.
++ */
++static u64 ti_csi2rx_timestamp(struct ti_csi2rx_ctx *ctx, u64 now)
++{
++	u64 prev = ctx->prev_done_ns;
++
++	ctx->prev_done_ns = now;
++
++	return frame_start_timestamp && prev ? prev : now;
++}
++
+ static void ti_csi2rx_drain_callback(void *param)
+ {
+ 	struct ti_csi2rx_ctx *ctx = param;
+@@ -726,6 +771,8 @@
+ 		return;
+ 	}
+ 
++	ti_csi2rx_timestamp(ctx, ktime_get_ns());
++
+ 	/*
+ 	 * If dma->queue is empty, it signals no buffer has arrived from
+ 	 * user space, so, queue more transaction to drain dma
+@@ -811,7 +858,7 @@
+ 	 * TODO: Derive the sequence number from the CSI2RX frame number
+ 	 * hardware monitor registers.
+ 	 */
+-	buf->vb.vb2_buf.timestamp = ktime_get_ns();
++	buf->vb.vb2_buf.timestamp = ti_csi2rx_timestamp(ctx, ktime_get_ns());
+ 	buf->vb.sequence = ctx->sequence++;
+ 
+ 	spin_lock_irqsave(&dma->lock, flags);
+@@ -1061,6 +1108,7 @@
+ 	ti_csi2rx_setup_shim(ctx);
+ 
+ 	ctx->sequence = 0;
++	ctx->prev_done_ns = 0;
+ 
+ 	spin_lock_irqsave(&dma->lock, flags);
+ 

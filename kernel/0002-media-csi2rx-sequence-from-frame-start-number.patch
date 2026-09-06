@@ -1,0 +1,213 @@
+media: cadence: csi2rx, ti: j721e-csi2rx: V4L2 sequence from the sensor's frame numbers
+
+The TI capture driver numbered buffers as it completed them, so a frame lost
+between the sensor and the DMA left no hole in the V4L2 sequence (the driver
+carried a TODO about this). The Cadence CSI2RX bridge has a per-stream frame
+monitor that stores the frame number of the last CSI-2 Frame Start short
+packet (STREAMn_MONITOR_CTRL at stream base + 0x10, STREAMn_MONITOR_FRAME at
++ 0x14; AM62A TRM SPRUJ16C 14.9.6.1.2.51/52, same IP as J722S).
+
+cadence: point each stream's frame monitor at the lowest virtual channel routed
+to it when the stream starts, clear it when the stream stops, and export
+cdns_csi2rx_get_frame_nb() beside cdns_csi2rx_negotiate_ppc().
+
+ti: derive the sequence from those frame numbers once the sensor is seen to
+change them, wrap included; keep the buffer count for sensors that send a
+constant number. Reading after DMA completion can race the next Frame Start
+during vertical blanking: a buffer then reads one high and the next repeats
+the number, so the sequence stutters once instead of drifting.
+
+Against ti-linux-6.12.y. Bench check: the frame number a given sensor sends
+(IMX296 unknown), and whether a stream monitor tracks a VC that another
+stream carries.
+
+--- a/drivers/media/platform/cadence/cdns-csi2rx.c
++++ b/drivers/media/platform/cadence/cdns-csi2rx.c
+@@ -5,6 +5,7 @@
+  * Copyright (C) 2017 Cadence Design Systems Inc.
+  */
+ 
++#include <linux/bitfield.h>
+ #include <linux/clk.h>
+ #include <linux/delay.h>
+ #include <linux/io.h>
+@@ -56,6 +57,13 @@
+ #define CSI2RX_STREAM_CFG_NUM_PIXELS_MASK		GENMASK(5, 4)
+ #define CSI2RX_STREAM_CFG_NUM_PIXELS(n)			((n) >> 1)
+ 
++#define CSI2RX_STREAM_MONITOR_CTRL_REG(n)	(CSI2RX_STREAM_BASE(n) + 0x010)
++#define CSI2RX_STREAM_MONITOR_CTRL_FRAME_MON_EN		BIT(15)
++#define CSI2RX_STREAM_MONITOR_CTRL_FRAME_MON_VC_MASK	GENMASK(14, 11)
++
++#define CSI2RX_STREAM_MONITOR_FRAME_REG(n)	(CSI2RX_STREAM_BASE(n) + 0x014)
++#define CSI2RX_STREAM_MONITOR_FRAME_NB_MASK		GENMASK(15, 0)
++
+ #define CSI2RX_LANES_MAX	4
+ #define CSI2RX_STREAMS_MAX	4
+ 
+@@ -138,6 +146,7 @@
+ 	struct phy			*dphy;
+ 
+ 	u32				vc_select[CSI2RX_STREAMS_MAX];
++	int				monitor_vc[CSI2RX_STREAMS_MAX]; /* -1: monitor off */
+ 	u8				num_pixels[CSI2RX_STREAMS_MAX];
+ 	u8				lanes[CSI2RX_LANES_MAX];
+ 	u8				num_lanes;
+@@ -438,6 +447,19 @@
+ 		writel(csi2rx->vc_select[i],
+ 		       csi2rx->base + CSI2RX_STREAM_DATA_CFG_REG(i));
+ 
++		/*
++		 * Point the stream frame monitor at the lowest virtual channel
++		 * routed to this stream, so the frame number of the last Frame
++		 * Start packet can be read back (cdns_csi2rx_get_frame_nb).
++		 * Programmed while the stream is stopped, as the TRM requires.
++		 */
++		csi2rx->monitor_vc[i] = csi2rx->vc_select[i] ?
++			__ffs(csi2rx->vc_select[i] >> 16) : 0;
++		writel(CSI2RX_STREAM_MONITOR_CTRL_FRAME_MON_EN |
++		       FIELD_PREP(CSI2RX_STREAM_MONITOR_CTRL_FRAME_MON_VC_MASK,
++				  csi2rx->monitor_vc[i]),
++		       csi2rx->base + CSI2RX_STREAM_MONITOR_CTRL_REG(i));
++
+ 		writel(CSI2RX_STREAM_CTRL_START,
+ 		       csi2rx->base + CSI2RX_STREAM_CTRL_REG(i));
+ 	}
+@@ -492,6 +514,9 @@
+ 			dev_warn(csi2rx->dev,
+ 				 "Failed to stop streaming on pad%u\n", i);
+ 
++		writel(0, csi2rx->base + CSI2RX_STREAM_MONITOR_CTRL_REG(i));
++		csi2rx->monitor_vc[i] = -1;
++
+ 		reset_control_assert(csi2rx->pixel_rst[i]);
+ 		clk_disable_unprepare(csi2rx->pixel_clk[i]);
+ 	}
+@@ -887,6 +912,33 @@
+ }
+ EXPORT_SYMBOL(cdns_csi2rx_negotiate_ppc);
+ 
++/**
++ * cdns_csi2rx_get_frame_nb - Frame number of the last Frame Start packet on a VC
++ * @subdev: point to &struct v4l2_subdev
++ * @vc: virtual channel
++ * @nb: the 16-bit frame number from the CSI-2 Frame Start short packet
++ *
++ * Valid while a stream whose monitor watches @vc is running.
++ *
++ * Return: 0 on success, -ENOENT if no running stream monitors @vc.
++ */
++int cdns_csi2rx_get_frame_nb(struct v4l2_subdev *subdev, unsigned int vc, u16 *nb)
++{
++	struct csi2rx_priv *csi2rx = v4l2_subdev_to_csi2rx(subdev);
++	unsigned int i;
++
++	for (i = 0; i < csi2rx->max_streams; i++) {
++		if (csi2rx->monitor_vc[i] != (int)vc)
++			continue;
++		*nb = FIELD_GET(CSI2RX_STREAM_MONITOR_FRAME_NB_MASK,
++				readl(csi2rx->base + CSI2RX_STREAM_MONITOR_FRAME_REG(i)));
++		return 0;
++	}
++
++	return -ENOENT;
++}
++EXPORT_SYMBOL(cdns_csi2rx_get_frame_nb);
++
+ static const struct v4l2_subdev_pad_ops csi2rx_pad_ops = {
+ 	.enum_mbus_code		= csi2rx_enum_mbus_code,
+ 	.get_fmt		= v4l2_subdev_get_fmt,
+@@ -1007,6 +1059,7 @@
+ 	}
+ 
+ 	csi2rx->max_streams = (dev_cfg >> 4) & 7;
++	memset(csi2rx->monitor_vc, 0xff, sizeof(csi2rx->monitor_vc)); /* all -1 */
+ 	if (csi2rx->max_streams > CSI2RX_STREAMS_MAX) {
+ 		dev_err(&pdev->dev, "Invalid number of streams: %u\n",
+ 			csi2rx->max_streams);
+--- a/drivers/media/platform/ti/j721e-csi2rx/j721e-csi2rx.c
++++ b/drivers/media/platform/ti/j721e-csi2rx/j721e-csi2rx.c
+@@ -113,6 +113,11 @@
+ 	u32				idx;
+ 	u32				vc;
+ 	u32				stream;
++	/* Sequence from the sensor's CSI-2 frame numbers, when it sends any. */
++	u16				nb_last;
++	u32				nb_seq;
++	bool				nb_live;
++	bool				nb_seen;
+ };
+ 
+ struct ti_csi2rx_dev {
+@@ -322,6 +327,8 @@
+ 
+ extern int cdns_csi2rx_negotiate_ppc(struct v4l2_subdev *subdev,
+ 				     unsigned int pad, u8 *ppc);
++extern int cdns_csi2rx_get_frame_nb(struct v4l2_subdev *subdev,
++				    unsigned int vc, u16 *nb);
+ 
+ /* Forward declaration needed by ti_csi2rx_dma_callback. */
+ static int ti_csi2rx_start_dma(struct ti_csi2rx_ctx *ctx,
+@@ -791,6 +798,38 @@
+ 	return ret;
+ }
+ 
++/*
++ * The V4L2 sequence number should count every frame the sensor produced, so a
++ * frame lost before this DMA completion leaves a hole. The Cadence bridge keeps
++ * the frame number of the last Frame Start packet per monitored virtual
++ * channel. When the sensor numbers its frames (the number changes), the
++ * sequence follows those numbers, wrap included; a sensor that sends a constant
++ * number falls back to counting completed buffers, as before.
++ *
++ * The register is read after the DMA completion, so if the next Frame Start
++ * arrives first (short vertical blanking, late callback) one buffer reads one
++ * too high and the next reads the same number again; the sequence then repeats
++ * once instead of drifting.
++ */
++static u32 ti_csi2rx_sequence(struct ti_csi2rx_ctx *ctx)
++{
++	u32 seq = ctx->sequence++;
++	u16 nb;
++
++	if (cdns_csi2rx_get_frame_nb(ctx->csi->source, ctx->vc, &nb))
++		return seq;
++
++	if (ctx->nb_seen) {
++		ctx->nb_seq += (s16)(nb - ctx->nb_last);
++		if (ctx->nb_seq)
++			ctx->nb_live = true;
++	}
++	ctx->nb_last = nb;
++	ctx->nb_seen = true;
++
++	return ctx->nb_live ? ctx->nb_seq : seq;
++}
++
+ static void ti_csi2rx_dma_callback(void *param)
+ {
+ 	struct ti_csi2rx_buffer *buf = param;
+@@ -798,12 +837,8 @@
+ 	struct ti_csi2rx_dma *dma = &ctx->dma;
+ 	unsigned long flags;
+ 
+-	/*
+-	 * TODO: Derive the sequence number from the CSI2RX frame number
+-	 * hardware monitor registers.
+-	 */
+ 	buf->vb.vb2_buf.timestamp = ktime_get_ns();
+-	buf->vb.sequence = ctx->sequence++;
++	buf->vb.sequence = ti_csi2rx_sequence(ctx);
+ 
+ 	spin_lock_irqsave(&dma->lock, flags);
+ 
+@@ -1052,6 +1087,9 @@
+ 	ti_csi2rx_setup_shim(ctx);
+ 
+ 	ctx->sequence = 0;
++	ctx->nb_seq = 0;
++	ctx->nb_seen = false;
++	ctx->nb_live = false;
+ 
+ 	spin_lock_irqsave(&dma->lock, flags);
+ 
